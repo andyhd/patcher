@@ -1,0 +1,174 @@
+#!/bin/bash
+
+function mysql_exec {
+
+    SQL="$1"
+    mysql -h "$DBHOST" -u "$DBUSER" -p"$DBPASS" -D "$DATABASE" -N -s --default-character-set UTF8 -e "$SQL"
+
+}
+
+function init {
+
+  read -r -d '' SQL <<'END_SQL'
+-- create patches table
+CREATE TABLE IF NOT EXISTS patches (
+  filename VARCHAR(255) NOT NULL PRIMARY KEY,
+  active BOOLEAN NOT NULL DEFAULT FALSE,
+  checksum CHAR(41) NOT NULL
+);
+
+-- procedure to apply/remove the patch
+DROP PROCEDURE IF EXISTS patch;
+DELIMITER |
+CREATE PROCEDURE patch (IN patch_file VARCHAR(255), IN hash CHAR(41), IN action CHAR(8))
+BEGIN
+
+  DECLARE applied BOOLEAN DEFAULT FALSE;
+  DECLARE checksum_colname CHAR(255);
+  DECLARE hash_ok BOOLEAN DEFAULT TRUE;
+
+  -- check whether the patch has been applied
+  SELECT active INTO applied FROM patches WHERE filename = patch_file;
+
+  -- add checksum column to patches table
+  SELECT COLUMN_NAME INTO checksum_colname FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=database() AND TABLE_NAME='patches' AND COLUMN_NAME='checksum';
+  IF (checksum_colname IS NULL) THEN
+    BEGIN
+      SELECT 'Adding checksum column' AS ' ';
+      ALTER TABLE patches ADD COLUMN checksum CHAR(41) NOT NULL;
+      SELECT 'checksum' INTO checksum_colname;
+    END;
+  END IF;
+
+  -- check the hash matches the stored checksum (if there is one)
+  SELECT IF((hash = checksum OR checksum = ''), 1, 0) INTO hash_ok FROM patches WHERE filename = patch_file;
+
+  -- apply/unapply the patch
+  IF (hash_ok = TRUE) THEN
+    BEGIN
+      IF (action = "apply" AND applied = FALSE) THEN
+        BEGIN
+          CALL up();
+          REPLACE INTO patches SET filename = patch_file, checksum = hash, active = TRUE;
+          SELECT CONCAT('Applied ', patch_file) AS ' ';
+        END;
+      ELSEIF (action = "rollback" AND applied = TRUE) THEN
+        BEGIN
+          CALL down();
+          REPLACE INTO patches SET filename = patch_file, checksum = hash, active = FALSE;
+          SELECT CONCAT('Unapplied ', patch_file) AS ' ';
+        END;
+      END IF;
+    END;
+  ELSE
+    BEGIN
+      SELECT CONCAT('Stopping because checksum failed for ', patch_file) AS ' ';
+    END;
+  END IF;
+END
+|
+END_SQL
+
+  mysql_exec "$SQL"
+
+}
+
+function patch {
+
+  # apply/unapply
+  ACTION="$1"
+
+  # patch filename
+  PATCH_FILE="$2"
+
+  # hash
+  HASH=`shasum $PATCH_FILE | cut -f1 -d' '`
+
+  read -r -d '' SQL <<ENDSQL
+-- clear the way for the patch
+DROP PROCEDURE IF EXISTS up;
+DROP PROCEDURE IF EXISTS down;
+
+-- load the patch
+SOURCE $PATCH_FILE;
+
+CALL patch("$PATCH_FILE", "$HASH", "$ACTION");
+ENDSQL
+
+    mysql_exec "$SQL"
+
+}
+
+if [ $# -lt 3 -o $# -gt 4 ]; then
+  echo "Usage: `basename $0` ACTION FILENAME|DIRECTORY DATABASE [DATE]"
+  echo "Where ACTION is either apply or rollback"
+  echo "and FILENAME is the filename of a patch to apply/rollback"
+  echo "or DIRECTORY is the name of a directory containing patches"
+  echo "and DATE is a date/time in the format YYYYmmddHHMMSS"
+  echo "Example: `basename $0` apply test.sql user"
+  echo
+  echo "Database connection details can be set in an rc file named in"
+  echo "the PATCHERRC environment variable"
+  echo "Example: export PATCHERRC=/tmp/patcherrc"
+  echo "If this variable is not set, $HOME/.patcherrc will be tried."
+  echo "If $HOME/.patcherrc file is not found, /etc/patcherrc"
+  echo "will be tried. Finally, default values will be used."
+  echo
+  echo "Example rc file:"
+  echo "DBHOST=localhost"
+  echo "DBUSER=dbuser"
+  echo "DBPASS=secret"
+  echo
+  exit 1
+fi
+
+# should be "apply" or "rollback"
+ACTION="$1"
+DATABASE="$3"
+DATE="$4"
+
+# DO NOT EDIT THESE DEFAULTS
+# you can override these by setting them in the $PATCHERRC file
+DBHOST="localhost"
+DBUSER="charles"
+DBPASS="test"
+
+# don't allow rollback without a date
+# apply to latest patch by default
+if [ "x$DATE" == "x" ]; then DATE=`date +"%Y%m%d%H%M%S"`; fi
+
+# attempt to load a configuration file for database credentials
+if [ -f "$PATCHERRC" ]; then
+  source "$PATCHERRC"
+elif [ -f "$HOME/.patcherrc" ]; then
+  source "$HOME/.patcherrc"
+elif [ -f "/etc/patcherrc" ]; then
+  source "/etc/patcherrc"
+fi
+
+# create patches table and patch stored procedure
+init $DATABASE
+
+# called with $0 apply [dir]
+if [ -d "$2" ]; then
+  FILES=`ls -1 "$2"/*.sql`
+  if [ "$ACTION" == "rollback" ]; then
+    FILES=`ls -1r "$2"/*.sql`
+  fi
+  for PATCH_FILE in $FILES; do
+    if [ -f "$PATCH_FILE" ]; then
+      TIMESTAMP=`basename "$PATCH_FILE" | cut -f 1 -d '.'`
+      if [ "$ACTION" == "rollback" ]; then
+        [ "$TIMESTAMP" -gt "$DATE" ] && patch "$ACTION" "$PATCH_FILE"
+      fi
+      if [ "$ACTION" == "apply" ]; then
+        [ "$TIMESTAMP" -lt "$DATE" ] && patch "$ACTION" "$PATCH_FILE"
+      fi
+    fi
+  done
+fi
+
+# called with $0 apply [file]
+if [ -f "$2" ]; then
+  patch "$ACTION" "$2"
+fi
